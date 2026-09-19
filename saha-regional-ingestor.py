@@ -70,6 +70,11 @@ LOG_FILE = os.getenv("LOG_FILE", "/tmp/saha-ingestor.log")
 TASK_POLL_INTERVAL = int(os.getenv("TASK_POLL_INTERVAL", "30"))
 # Optional: force recording length in seconds (e.g. 600 for a 10-minute test)
 RECORDING_DURATION_SECONDS = os.getenv("RECORDING_DURATION_SECONDS", "").strip()
+# Video compression settings (H.264 re-encode instead of stream copy, to shrink
+# uploaded/stored file size). Output stays standard HLS (.ts + .m3u8), so
+# playback compatibility is unaffected.
+VIDEO_CRF = os.getenv("VIDEO_CRF", "23")
+VIDEO_PRESET = os.getenv("VIDEO_PRESET", "veryfast")
 
 _stop_event = threading.Event()
 log = logging.getLogger("saha-ingestor")
@@ -461,7 +466,13 @@ def record_match(task: IngestTask) -> Path | None:
         "-i", task.stream_url,
         # Output options (must come after -i)
         "-t", str(duration_secs),
-        "-c:v", "copy",
+        "-c:v", "libx264",
+        "-preset", VIDEO_PRESET,
+        "-crf", VIDEO_CRF,
+        "-pix_fmt", "yuv420p",
+        # Force a keyframe at every segment boundary so the HLS muxer can cut
+        # segments cleanly even though the video is now re-encoded (not copied).
+        "-force_key_frames", f"expr:gte(t,n_forced*{segment_time})",
         "-c:a", "aac",
         "-f", "hls",
         "-hls_time", str(segment_time),
