@@ -71,6 +71,16 @@ TASK_POLL_INTERVAL = int(os.getenv("TASK_POLL_INTERVAL", "30"))
 # Optional: force recording length in seconds (e.g. 600 for a 10-minute test)
 RECORDING_DURATION_SECONDS = os.getenv("RECORDING_DURATION_SECONDS", "").strip()
 
+# Reliability / quality-control knobs for the recording loop
+# Don't upload/register a match that captured less content than this (seconds).
+MIN_RECORDED_SECONDS = int(os.getenv("MIN_RECORDED_SECONDS", "60"))
+# Max ffmpeg attempts per match (each retry re-fetches a fresh task/URL).
+FFMPEG_RETRIES = int(os.getenv("FFMPEG_RETRIES", "3"))
+# ffmpeg input socket/HTTP read timeout (microseconds) — fail fast, don't hang.
+FFMPEG_RW_TIMEOUT_US = int(os.getenv("FFMPEG_RW_TIMEOUT_US", "15000000"))
+# Stop retrying once fewer than this many seconds remain of the match.
+MIN_REMAINING_TO_RECORD = int(os.getenv("MIN_REMAINING_TO_RECORD", "10"))
+
 _stop_event = threading.Event()
 log = logging.getLogger("saha-ingestor")
 
@@ -160,6 +170,22 @@ def max_segment_index(out_dir: Path) -> int:
         if suffix.isdigit():
             highest = max(highest, int(suffix))
     return highest
+
+
+def captured_duration_secs(out_dir: Path, segment_time: int) -> int:
+    """Approximate recorded seconds from the .ts files on disk.
+
+    Counts actual segment files, NOT the highest index: in a resumed match a
+    lone leftover segment can carry a huge index (e.g. output275.ts) while
+    holding only seconds of real media. Index-based math would let a 1-second
+    recording smuggle past the min-content guard.
+    """
+    count = 0
+    for path in out_dir.glob("output*.ts"):
+        suffix = path.stem.removeprefix("output")
+        if suffix.isdigit():
+            count += 1
+    return count * max(1, segment_time)
 
 
 def has_recorded_segments(out_dir: Path) -> bool:
@@ -435,87 +461,162 @@ def record_match(task: IngestTask) -> Path | None:
         return out_dir if has_recorded_segments(out_dir) else None
 
     segment_time = int(task.settings.get("segmentTime", 10))
-    start_number = recording_start_number(task, out_dir)
-    segment_file = str(out_dir / "output%d.ts")
-    manifest_file = str(out_dir / "index.m3u8")
-
-    existing = max_segment_index(out_dir) + 1 if has_recorded_segments(out_dir) else 0
+    active_stream_url = task.stream_url
+    host = urlparse(active_stream_url).netloc or active_stream_url[:60]
 
     # Detect if input is HLS (not RTSP) - RTSP options don't apply to HLS inputs
-    is_hls_input = task.stream_url.lower().endswith('.m3u8') or '/openlive/' in task.stream_url.lower()
-    
-    cmd = ["ffmpeg", "-loglevel", "warning"]
-    
-    # Input options (must come before -i)
-    if not is_hls_input:
-        # RTSP-specific options
+    is_hls_input = (
+        active_stream_url.lower().endswith(".m3u8")
+        or "/openlive/" in active_stream_url.lower()
+    )
+
+    attempts_left = max(1, FFMPEG_RETRIES)
+
+    while not _stop_event.is_set() and attempts_left > 0:
+        attempts_left -= 1
+
+        captured = captured_duration_secs(out_dir, segment_time)
+        remaining = duration_secs - captured
+        if remaining <= MIN_REMAINING_TO_RECORD:
+            break
+
+        start_number = recording_start_number(task, out_dir)
+        segment_file = str(out_dir / "output%d.ts")
+        manifest_file = str(out_dir / "index.m3u8")
+
+        cmd = ["ffmpeg", "-loglevel", "warning"]
+
+        # Input options (must come before -i)
+        cmd.extend(["-rw_timeout", str(FFMPEG_RW_TIMEOUT_US)])
+        if not is_hls_input:
+            # RTSP-specific options
+            cmd.extend(["-rtsp_transport", "tcp"])
+
+        # HTTP reconnect flags unchanged from upstream behavior — recovery from a
+        # dead/expired URL is handled by the retry loop below (re-fetches a fresh
+        # task/URL), not by exotic reconnect options that older ffmpeg rejects.
         cmd.extend([
-            "-rtsp_transport", "tcp",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "30",
+            "-i", active_stream_url,
+            # Output options (must come after -i)
+            "-t", str(remaining),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-f", "hls",
+            "-hls_time", str(segment_time),
+            "-hls_playlist_type", "vod",
+            "-start_number", str(start_number),
+            "-hls_segment_filename", segment_file,
+            "-y",
+            manifest_file,
         ])
-    
-    # Generic reconnection options (work for both RTSP and HLS)
-    cmd.extend([
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "30",
-        "-i", task.stream_url,
-        # Output options (must come after -i)
-        "-t", str(duration_secs),
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-f", "hls",
-        "-hls_time", str(segment_time),
-        "-hls_playlist_type", "vod",
-        "-start_number", str(start_number),
-        "-hls_segment_filename", segment_file,
-        "-y",
-        manifest_file,
-    ])
 
-    host = urlparse(task.stream_url).netloc or task.stream_url[:60]
-    if task.is_recovery or existing > 0:
-        log.info(
-            "Recording resume | venue=%s | match=%s | %ds remaining | "
-            "segments on disk=%d | hls_start_number=%d",
+        attempt_label = ""
+        if FFMPEG_RETRIES > 1:
+            attempt_label = f" (attempt {FFMPEG_RETRIES - attempts_left}/{FFMPEG_RETRIES})"
+
+        if task.is_recovery or max_segment_index(out_dir) >= 0:
+            log.info(
+                "Recording resume%s | venue=%s | match=%s | %ds remaining | "
+                "segments on disk=%d | hls_start_number=%d",
+                attempt_label,
+                task.venue_slug,
+                task.match_time,
+                remaining,
+                max_segment_index(out_dir) + 1,
+                start_number,
+            )
+        else:
+            log.info(
+                "Recording started%s | venue=%s | match=%s | duration=%ds",
+                attempt_label,
+                task.venue_slug,
+                task.match_time,
+                duration_secs,
+            )
+        log.info("  Stream host: %s", host)
+        log.info("  Output: %s", out_dir)
+        log.info("FFmpeg cmd: %s", " ".join(cmd))
+
+        ffmpeg_ok = False
+        proc = None
+        try:
+            proc = subprocess.run(cmd, timeout=remaining + 180)
+            ffmpeg_ok = proc.returncode == 0
+            if not ffmpeg_ok:
+                log.error("FFmpeg exited with code %d", proc.returncode)
+        except subprocess.TimeoutExpired:
+            log.error("FFmpeg recording timed out.")
+
+        if ffmpeg_ok:
+            log.info(
+                "FFmpeg run succeeded for %s @ %s — filling any remaining time.",
+                task.venue_slug,
+                task.match_time,
+            )
+            continue
+
+        if _stop_event.is_set():
+            break
+
+        if attempts_left <= 0:
+            log.warning(
+                "FFmpeg failed and no retries remain for %s @ %s.",
+                task.venue_slug,
+                task.match_time,
+            )
+            break
+
+        log.warning(
+            "FFmpeg run failed (rc=%s) for %s @ %s — retrying with a fresh task/URL.",
+            getattr(proc, "returncode", "?"),
             task.venue_slug,
             task.match_time,
-            duration_secs,
-            existing,
-            start_number,
         )
-    else:
-        log.info(
-            "Recording started | venue=%s | match=%s | duration=%ds",
+        try:
+            fresh = fetch_task()
+            swapped = False
+            if (
+                fresh.should_record
+                and fresh.stream_url
+                and fresh.match_time == task.match_time
+                and fresh.stream_url != active_stream_url
+            ):
+                active_stream_url = fresh.stream_url
+                task.stream_url = active_stream_url
+                swapped = True
+                if fresh.settings:
+                    duration_secs = recording_duration_secs(fresh)
+            log.info(
+                "Refreshed task for retry: URL %s.",
+                "replaced" if swapped else "unchanged (same/absent URL)",
+            )
+        except RuntimeError as e:
+            log.warning("Could not refresh task for retry: %s", e)
+
+    captured = captured_duration_secs(out_dir, segment_time)
+    if captured < MIN_RECORDED_SECONDS:
+        log.error(
+            "%s @ %s produced only %ds of content (< MIN_RECORDED_SECONDS=%ds) — not uploading/registering.",
             task.venue_slug,
             task.match_time,
-            duration_secs,
+            captured,
+            MIN_RECORDED_SECONDS,
         )
-    log.info("  Stream host: %s", host)
-    log.info("  Output: %s", out_dir)
-
-    log.info("FFmpeg cmd: %s", " ".join(cmd))
-
-    ffmpeg_ok = False
-    try:
-        proc = subprocess.run(cmd, timeout=duration_secs + 180)
-        ffmpeg_ok = proc.returncode == 0
-        if not ffmpeg_ok:
-            log.error("FFmpeg exited with code %d", proc.returncode)
-    except subprocess.TimeoutExpired:
-        log.error("FFmpeg recording timed out.")
+        cleanup_local(out_dir)
+        return None
 
     if has_recorded_segments(out_dir):
         rebuild_hls_manifest(out_dir, segment_time)
-        if ffmpeg_ok:
-            log.info("Recording complete: %s", out_dir)
-        else:
-            log.warning(
-                "Recording interrupted — uploading %d segment(s) saved on disk",
-                max_segment_index(out_dir) + 1,
-            )
-        return out_dir
-
-    return None
+    log.info(
+        "Recording complete: %s (%d segment(s), ~%ds)",
+        out_dir,
+        max_segment_index(out_dir) + 1,
+        captured,
+    )
+    return out_dir
 
 
 def cleanup_local(folder: Path) -> None:
@@ -583,6 +684,12 @@ def run_ingestor() -> None:
     log.info("  Work dir: %s", WORK_DIR)
     if RECORDING_DURATION_SECONDS:
         log.info("  Recording override: %ss", RECORDING_DURATION_SECONDS)
+    log.info(
+        "  Min content: >=%ss | ffmpeg retries: %d | rw_timeout: %dms",
+        MIN_RECORDED_SECONDS,
+        FFMPEG_RETRIES,
+        FFMPEG_RW_TIMEOUT_US // 1000,
+    )
     log.info("==============================================")
 
     start_upload_workers()
